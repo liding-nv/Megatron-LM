@@ -319,7 +319,11 @@ class ColocatedBridgeCommunicator:
             return SliceInfo(start=0, size=batch_size)
         self._check_divisible(batch_size)
         if self.direction is BridgeDirection.FAN_OUT:
-            dp_idx = self.rank_to_dest_pos[self.current_rank][0]
+            # rank_to_dest_pos only tracks cp=0 canonical slots; CP>0 dest
+            # ranks must slice the same batch slot as their cp=0 sibling so
+            # the intra-CP all_reduce in backward sees matching shapes.
+            # rank_to_dest_coords has an entry per (dp, tp, cp).
+            dp_idx = self.rank_to_dest_coords[self.current_rank][0]
         else:  # FAN_IN
             dp_idx = self.rank_to_src_pos[self.current_rank][0]
         slot = dp_idx % self.scale
