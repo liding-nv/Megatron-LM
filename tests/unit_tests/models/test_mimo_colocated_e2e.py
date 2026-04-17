@@ -143,6 +143,7 @@ def run_colocated_test(
     encoder_dp,
     llm_tp,
     llm_dp,
+    llm_cp=1,
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
@@ -158,9 +159,10 @@ def run_colocated_test(
 
     encoder_name = "images"
 
-    # Both grids at offset=0 (colocated on same ranks)
+    # Both grids at offset=0 (colocated on same ranks). Encoder stays CP=1;
+    # LLM CP follows the parameter so tests can exercise the CP>1 backward.
     encoder_grid = create_hypercomm_grid(offset=0, tp=encoder_tp, cp=1, pp=1, dp=encoder_dp)
-    llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=1, pp=1, dp=llm_dp)
+    llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=llm_cp, pp=1, dp=llm_dp)
 
     # dist.new_group is a collective — create all embedding PGs up front.
     create_all_embedding_groups([encoder_grid, llm_grid])
@@ -409,4 +411,54 @@ class TestMimoColocatedE2E:
             seq_length=64,
             micro_batch_size=2,
             num_microbatches=4,
+        )
+
+    def test_colocated_fan_in_cp2_8gpu(self):
+        """Encoder TP2/DP4, LLM TP2/DP2/CP2 — fan-in with dest CP=2.
+
+        Exercises the real PartitionAdapter.shard path: the LLM's
+        context_parallel_size=2 config drives sequence sharding via
+        index_select, whose backward is zero-pad. The bridge communicator's
+        backward must therefore intra-CP all_reduce to return a full-sequence
+        gradient to the encoder — covered by this end-to-end path.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_colocated_test(
+            encoder_tp=2,
+            encoder_dp=4,
+            llm_tp=2,
+            llm_dp=2,
+            llm_cp=2,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            # seq_length must be divisible by 2*cp=4 (PartitionAdapter
+            # causal-load-balancing splits sequence into 2*cp chunks).
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=2,
+        )
+
+    def test_colocated_fan_out_cp2_8gpu(self):
+        """Encoder TP4/DP2, LLM TP1/DP4/CP2 — fan-out with dest CP=2.
+
+        Complements the fan-in CP test: exercises the per-CP-level fan-out
+        gather groups and the backward CP reduction for the narrow-adjoint
+        path.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_colocated_test(
+            encoder_tp=4,
+            encoder_dp=2,
+            llm_tp=1,
+            llm_dp=4,
+            llm_cp=2,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=4,
+            num_microbatches=2,
         )
