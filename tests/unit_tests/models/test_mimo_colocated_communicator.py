@@ -146,6 +146,64 @@ class TestRankMappings:
         assert comm.rank_to_src_pos == {4: (0, 0), 5: (0, 1), 6: (1, 0), 7: (1, 1)}
         assert comm.rank_to_dest_pos == {4: (0, 0), 5: (1, 0), 6: (2, 0), 7: (3, 0)}
 
+    @pytest.mark.parametrize(
+        "src_tp, src_dp, dest_tp, dest_dp, dest_cp, expected_dest_pos, expected_dest_coords",
+        [
+            # Fan-in with dest CP=2: TP2/DP4 → TP2/DP2/CP2. rank_to_dest_pos
+            # only holds canonical (cp=0) ranks per (dp, tp); full (dp, tp, cp)
+            # is stored in rank_to_dest_coords.
+            (
+                2,
+                4,
+                2,
+                2,
+                2,
+                {0: (0, 0), 1: (0, 1), 4: (1, 0), 5: (1, 1)},
+                {
+                    0: (0, 0, 0),
+                    1: (0, 1, 0),
+                    2: (0, 0, 1),
+                    3: (0, 1, 1),
+                    4: (1, 0, 0),
+                    5: (1, 1, 0),
+                    6: (1, 0, 1),
+                    7: (1, 1, 1),
+                },
+            ),
+            # Fan-out with dest CP=2: TP4/DP2 → TP1/DP4/CP2.
+            (
+                4,
+                2,
+                1,
+                4,
+                2,
+                {0: (0, 0), 2: (1, 0), 4: (2, 0), 6: (3, 0)},
+                {
+                    0: (0, 0, 0),
+                    1: (0, 0, 1),
+                    2: (1, 0, 0),
+                    3: (1, 0, 1),
+                    4: (2, 0, 0),
+                    5: (2, 0, 1),
+                    6: (3, 0, 0),
+                    7: (3, 0, 1),
+                },
+            ),
+        ],
+        ids=["fan_in_cp2", "fan_out_cp2"],
+    )
+    def test_rank_mappings_with_cp(
+        self, src_tp, src_dp, dest_tp, dest_dp, dest_cp, expected_dest_pos, expected_dest_coords
+    ):
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, cp=dest_cp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid)
+
+        assert comm.rank_to_dest_pos == expected_dest_pos
+        assert comm.rank_to_dest_coords == expected_dest_coords
+        assert comm.dest_cp_size == dest_cp
+        assert comm.dest_cp_pg is not None
+
 
 # ── Test 2: All-gather groups ──────────────────────────────────────────────────
 
@@ -182,6 +240,27 @@ class TestAllGatherGroups:
         comm = make_comm(src_grid, dest_grid)
 
         assert comm.gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
+        assert comm.gather_pg is not None
+
+    def test_fan_out_gather_groups_with_cp(self):
+        """Fan-out with dest CP=2: each (src_dp, dest_tp) slot splits into
+        per-cp-level groups so every world rank lands in exactly one subgroup.
+
+        src=(tp=4, dp=2), dest=(tp=1, dp=4, cp=2), scale=2. Expected groups
+        (one per src_dp × dest_tp × cp_idx, scale=2 ranks each):
+          src_dp=0, cp=0: dest_dp=[0,1] → [rank 0, rank 2]
+          src_dp=0, cp=1: dest_dp=[0,1] → [rank 1, rank 3]
+          src_dp=1, cp=0: dest_dp=[2,3] → [rank 4, rank 6]
+          src_dp=1, cp=1: dest_dp=[2,3] → [rank 5, rank 7]
+        """
+        src_grid = create_hypercomm_grid(tp=4, dp=2)
+        dest_grid = create_hypercomm_grid(tp=1, cp=2, dp=4)
+        comm = make_comm(src_grid, dest_grid)
+
+        assert comm.gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
+        # Every world rank must appear exactly once across all fan-out groups.
+        flat = [r for g in comm.gather_group_ranks for r in g]
+        assert sorted(flat) == list(range(8))
         assert comm.gather_pg is not None
 
 
