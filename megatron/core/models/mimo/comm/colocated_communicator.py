@@ -162,6 +162,19 @@ class ColocatedBridgeCommunicator:
                     f"Source CP must be 1 for ColocatedBridgeCommunicator, got {src_cp_size}"
                 )
 
+        # _build_rank_mappings assumes that _gen_rank_enum(['tp']) yields cp
+        # varying fastest for fixed dp — true only when cp appears BEFORE dp
+        # in dim_names (reversed, cp becomes an inner loop around dp). If the
+        # caller reverses them, dp_idx advances at the wrong cp level and
+        # rank_to_dest_coords is silently wrong. Guard explicitly.
+        if 'cp' in self.dest_grid.dim_names:
+            dim_names = self.dest_grid.dim_names
+            if dim_names.index('cp') > dim_names.index('dp'):
+                raise ValueError(
+                    f"dest_grid dim_names must have 'cp' before 'dp' "
+                    f"(e.g. ['tp','cp','pp','dp']); got {dim_names}"
+                )
+
         src_dp = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
         dest_dp = self.dest_grid.shape[self.dest_grid.dim_names.index('dp')]
         if src_dp % dest_dp != 0 and dest_dp % src_dp != 0:

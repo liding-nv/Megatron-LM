@@ -615,7 +615,46 @@ class TestBridgeGradients:
         )
         torch.testing.assert_close(input_tensor.grad, expected, rtol=0, atol=0)
 
-    # ── Test 5: equal DP is a pure identity forward and backward ────────────
+    # ── Test 5: dest CP>1 backward reconstructs full-seq grad via intra-CP reduce ─
+    @pytest.mark.parametrize(
+        "src_tp,src_dp,dest_tp,dest_dp,dest_cp", [(1, 8, 1, 4, 2)], ids=["fan_in_cp2"]
+    )
+    def test_cp_backward_reduces_partial_seq_grads(
+        self, src_tp, src_dp, dest_tp, dest_dp, dest_cp
+    ):
+        """Bridge backward must intra-CP all_reduce(SUM) before the fan op.
+
+        PartitionAdapter.shard uses index_select whose autograd adjoint is
+        zero-pad: each CP rank's grad at the bridge boundary covers only
+        its own 2*CP-chunk positions, zeros elsewhere. Without an intra-CP
+        all_reduce, every CP sibling would return only its own sequence
+        chunk and upstream gradients would lose information.
+        """
+        dim_mapping = {'b': 0, 's': 1, 'h': 2}
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, cp=dest_cp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
+
+        B_local, S, H = self.B_PER_RANK, 2 * dest_cp * 2, self.H
+        t = torch.full(
+            (B_local, S, H), float(dist.get_rank()), device='cuda'
+        ).requires_grad_()
+        out = comm.communicate(t)
+        assert out.shape == (B_local * comm.scale, S, H)
+
+        cp_rank = dest_grid.get_pg("cp").rank()
+        chunk = S // (2 * dest_cp)
+        mask = torch.zeros(S, device='cuda')
+        mask[cp_rank * chunk : (cp_rank + 1) * chunk] = 1.0
+        mask[(2 * dest_cp - 1 - cp_rank) * chunk : (2 * dest_cp - cp_rank) * chunk] = 1.0
+        grad_output = mask.view(1, S, 1).expand(B_local * comm.scale, S, H).contiguous()
+
+        out.backward(grad_output.to(dtype=out.dtype))
+
+        expected = torch.ones(B_local, S, H, device='cuda', dtype=t.grad.dtype)
+        torch.testing.assert_close(t.grad, expected, rtol=0, atol=1e-6)
+
+    # ── Test 6: equal DP is a pure identity forward and backward ────────────
     @pytest.mark.parametrize(
         "src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 4, 2)], ids=["tp4_dp2"]
     )
