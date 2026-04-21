@@ -129,10 +129,8 @@ class ColocatedBridgeCommunicator:
             )
 
         # Per-grid dim checks: tp/dp required; cp (if present) must be 1.
-        # Src PP must be 1; dest PP>1 is allowed — the three-phase colocated
-        # schedule orchestrates LLM PP, and fan-in groups are keyed by src
-        # (PP=1) position so each rank lands in exactly one group.
-        # CP>1 corrupts dp_idx when iterating get_rank_enum(['tp']) groups.
+        # Src PP must be 1; dest PP>1 is allowed. CP>1 corrupts dp_idx when
+        # iterating get_rank_enum(['tp']) groups.
         for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
             for required in ('tp', 'dp'):
                 if required not in grid.dim_names:
