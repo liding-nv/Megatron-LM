@@ -324,9 +324,37 @@ class TestValidateGrids:
             make_comm(src_grid, dest_grid)
 
     def test_cp_gt_one_rejected(self):
+        # Source CP>1 is explicitly disallowed; only dest CP>1 is supported.
         src_grid = create_hypercomm_grid(tp=2, cp=2, dp=2)
         dest_grid = create_hypercomm_grid(tp=4, dp=2)
-        with pytest.raises(ValueError, match="CP must be 1"):
+        with pytest.raises(ValueError, match="Source CP must be 1"):
+            make_comm(src_grid, dest_grid)
+
+    def test_dest_cp_after_dp_in_dim_names_rejected(self):
+        """Dest ``dim_names`` with ``cp`` *after* ``dp`` must be rejected.
+
+        ``_build_rank_mappings`` relies on ``get_rank_enum(['tp'])`` yielding
+        cp varying fastest for fixed dp. That only holds when ``cp`` appears
+        before ``dp`` in dim_names. If the ordering is reversed, dp_idx would
+        advance at the wrong cp level and ``rank_to_dest_coords`` would be
+        silently wrong — a latent bug hidden behind a guard. This negative
+        test makes sure the guard actually fires so the guard can't be
+        refactored away without a test failure.
+        """
+        if dist.get_world_size() < 8:
+            pytest.skip("requires at least 8 ranks")
+        src_grid = create_hypercomm_grid(tp=2, dp=4)
+        # Reversed order: dp before cp. ``create_hypercomm_grid`` hardcodes the
+        # canonical ordering, so build the broken grid directly.
+        dest_grid = HyperCommGrid(
+            shape=[1, 4, 1, 2],
+            dim_names=["tp", "dp", "pp", "cp"],
+            backend="nccl",
+        )
+        dest_grid.create_pg(["tp"])
+        dest_grid.create_pg(["cp"])
+        _active_grids.append(dest_grid)
+        with pytest.raises(ValueError, match="must have 'cp' before 'dp'"):
             make_comm(src_grid, dest_grid)
 
     def test_dp_not_divisible(self):
@@ -652,6 +680,65 @@ class TestBridgeGradients:
         out.backward(grad_output.to(dtype=out.dtype))
 
         expected = torch.ones(B_local, S, H, device='cuda', dtype=t.grad.dtype)
+        torch.testing.assert_close(t.grad, expected, rtol=0, atol=1e-6)
+
+    # ── Test 5b: dest CP>1 fan-out backward reconstructs full-seq grad ──────
+    @pytest.mark.parametrize(
+        "src_tp,src_dp,dest_tp,dest_dp,dest_cp", [(4, 2, 1, 4, 2)], ids=["fan_out_cp2"]
+    )
+    def test_cp_fan_out_backward_reduces_partial_seq_grads(
+        self, src_tp, src_dp, dest_tp, dest_dp, dest_cp
+    ):
+        """Fan-out companion to ``test_cp_backward_reduces_partial_seq_grads``.
+
+        Test 5 only covers fan-in (post-CP-reduce op is ``narrow``). Fan-out
+        takes a different code path: after the intra-CP ``all_reduce`` the
+        backward runs an ``all_gather`` across the per-CP-level sibling group
+        built by ``_build_fan_out_gather_groups``. This test feeds the same
+        PartitionAdapter-style zero-padded gradient pattern but through the
+        fan-out direction and verifies the returned input grad is the full
+        (all-ones) gradient across both the sequence AND the gathered batch.
+
+        Four regressions this catches:
+          * intra-CP ``all_reduce`` degraded to no-op → gradient stays
+            per-CP-rank sparse (ones only in this rank's chunks).
+          * fan-out gather groups **not** split per CP level (every world
+            rank lands in a single pooled group) → the CP ranks end up in
+            each other's gather group, duplicating values on the batch dim.
+          * wrong CP group (e.g. accidentally using ``dp_cp``) → the reduce
+            covers too many ranks and gradients get inflated.
+          * all-gather ordering wrong → values land in the wrong batch slot,
+            so the exact ``ones`` oracle fails.
+        """
+        dim_mapping = {'b': 0, 's': 1, 'h': 2}
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, cp=dest_cp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
+
+        B_full, S, H = self.B_PER_RANK * comm.scale, 2 * dest_cp * 2, self.H
+        # TP-replicated input (bridge contract): seed identically on every rank.
+        torch.manual_seed(42)
+        t = torch.ones(B_full, S, H, device='cuda', requires_grad=True)
+        out = comm.communicate(t)
+        assert out.shape == (self.B_PER_RANK, S, H)
+
+        cp_rank = dest_grid.get_pg("cp").rank()
+        chunk = S // (2 * dest_cp)
+        # Mask pattern mirroring ``get_batch_on_this_cp_rank``: this CP rank
+        # owns chunk ``cp_rank`` and chunk ``2*cp_size - 1 - cp_rank``. After
+        # summing across CP ranks the mask becomes all ones.
+        mask = torch.zeros(S, device='cuda')
+        mask[cp_rank * chunk : (cp_rank + 1) * chunk] = 1.0
+        mask[(2 * dest_cp - 1 - cp_rank) * chunk : (2 * dest_cp - cp_rank) * chunk] = 1.0
+        grad_output = mask.view(1, S, 1).expand(self.B_PER_RANK, S, H).contiguous()
+
+        out.backward(grad_output.to(dtype=out.dtype))
+
+        # Expected flow: intra-CP all_reduce → full-seq ones on every CP rank,
+        # then fan-out all-gather across the (src_dp, dest_tp, cp) sibling
+        # group concatenates scale=2 copies of ones along the batch dim,
+        # yielding ones(B_full, S, H) on every src rank.
+        expected = torch.ones(B_full, S, H, device='cuda', dtype=t.grad.dtype)
         torch.testing.assert_close(t.grad, expected, rtol=0, atol=1e-6)
 
     # ── Test 6: equal DP is a pure identity forward and backward ────────────
