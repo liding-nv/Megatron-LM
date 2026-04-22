@@ -16,12 +16,14 @@ from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.models.mimo.colocated_schedule import colocated_forward_backward_with_pp
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.transformer.enums import ModelType
 from tests.unit_tests.models.test_mimo_1f1b_schedule import (
+    build_no_sync_func,
     create_all_embedding_groups,
     create_hypercomm_grid,
     destroy_all_grids,
@@ -36,6 +38,68 @@ from tests.unit_tests.models.test_mimo_colocated_correctness import (
     _wire_training_hooks,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+def _wire_pp_training_hooks(mimo_model, language_pg, vision_pg, llm_grid):
+    """PP-aware variant of ``_wire_training_hooks`` for LLM PP>1.
+
+    ``calculate_per_token_loss=True`` on both sub-model configs pins DDP's
+    gradient_scaling_factor to 1.0 (pure SUM across DP). But with LLM PP>1,
+    the inner schedule only populates ``num_tokens`` on the last PP stage;
+    non-last stages get 0. Before the DP all-reduce, this helper broadcasts
+    ``num_tokens`` from the last LLM PP rank to earlier ones so every rank
+    arrives at the same ``N_global`` and the per-token divisor lands
+    uniformly on encoder + LLM grads.
+    """
+
+    no_sync_func = build_no_sync_func(mimo_model)
+    pp_group = llm_grid.get_pg("pp")
+
+    def finalize_grads_func(model_list, num_tokens, force_all_reduce=False, **kwargs):
+        assert num_tokens is not None, (
+            "finalize_grads_func expects calculate_per_token_loss=True on the "
+            "TransformerConfig so the schedule forwards total_num_tokens; got None."
+        )
+
+        if pp_group.size() > 1:
+            last_rank = dist.get_global_rank(pp_group, pp_group.size() - 1)
+            dist.broadcast(num_tokens, src=last_rank, group=pp_group)
+
+        llm_dp_pg = language_pg.dp_cp if language_pg.dp_cp is not None else language_pg.dp
+        dist.all_reduce(num_tokens, group=llm_dp_pg, op=dist.ReduceOp.SUM)
+        n_global = num_tokens.item()
+
+        if mimo_model.language_model is not None:
+            finalize_model_grads(
+                [mimo_model.language_model],
+                num_tokens=None,
+                pg_collection=language_pg,
+                force_all_reduce=force_all_reduce,
+            )
+        for submodule in mimo_model.modality_submodules.values():
+            if submodule is not None:
+                finalize_model_grads(
+                    [submodule],
+                    num_tokens=None,
+                    pg_collection=vision_pg,
+                    force_all_reduce=force_all_reduce,
+                )
+
+        if n_global > 0:
+            inv = 1.0 / n_global
+            if mimo_model.language_model is not None:
+                mimo_model.language_model.scale_gradients(inv)
+            for submodule in mimo_model.modality_submodules.values():
+                if submodule is not None:
+                    submodule.scale_gradients(inv)
+
+    mimo_model.config.no_sync_func = no_sync_func
+    mimo_model.config.finalize_model_grads_func = finalize_grads_func
+    mimo_model.config.grad_scale_func = lambda loss: (
+        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
+        if isinstance(loss, (int, float))
+        else loss
+    )
 
 
 def _assert_llm_weights_match_pp_aware(
@@ -153,10 +217,9 @@ def _run_pp_weight_oracle(
     ref_per_rank_mbs = global_batch_size // ref_llm_dp
 
     ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=False,
+        overlap_grad_reduce=True,
         bucket_size=10000,
         use_distributed_optimizer=True,
-        gradient_reduce_div_factor=1,
     )
 
     dist_enc_grid = create_hypercomm_grid(
@@ -183,6 +246,10 @@ def _run_pp_weight_oracle(
         vocab_size=vocab_size,
         seq_len=seq_length,
         ddp_config=ddp_config,
+        bf16=False,
+        bias=False,
+        dropout=False,
+        per_token_loss=True,
     )
     dist_model.model_type = ModelType.encoder_or_decoder
 
@@ -196,6 +263,10 @@ def _run_pp_weight_oracle(
         vocab_size=vocab_size,
         seq_len=seq_length,
         ddp_config=ddp_config,
+        bf16=False,
+        bias=False,
+        dropout=False,
+        per_token_loss=True,
     )
     ref_model.model_type = ModelType.encoder_or_decoder
 
@@ -213,7 +284,7 @@ def _run_pp_weight_oracle(
         num_layers=num_layers,
     )
 
-    _wire_training_hooks(dist_model, dist_lang_pg, dist_vis_pg)
+    _wire_pp_training_hooks(dist_model, dist_lang_pg, dist_vis_pg, dist_llm_grid)
     _wire_training_hooks(ref_model, ref_lang_pg, ref_vis_pg)
 
     opt_config = OptimizerConfig(
@@ -221,7 +292,7 @@ def _run_pp_weight_oracle(
         lr=1e-4,
         weight_decay=0.01,
         clip_grad=1.0,
-        bf16=True,
+        bf16=False,
         use_distributed_optimizer=True,
     )
     dist_optimizer = get_mimo_optimizer(dist_model, opt_config)
@@ -266,14 +337,16 @@ def _run_pp_weight_oracle(
         f"Dist grad_norm={dist_gn} — three-phase schedule produced zero grads."
     )
 
-    def _sum_loss(loss_mask_unused, output_tensor):
+    def _sum_loss(loss_mask, output_tensor):
+        """Per-token-loss 3-tuple matching ``_wire_training_hooks`` contract."""
         if output_tensor is None:
-            return (
-                torch.tensor(0.0, device='cuda', requires_grad=True),
-                {'loss_reduced': 0.0},
-            )
-        loss = output_tensor.float().sum()
-        return loss, {'loss_reduced': loss.detach().item()}
+            zero_loss = torch.tensor(0.0, device='cuda', requires_grad=True)
+            zero_count = torch.tensor(0, device='cuda', dtype=torch.int)
+            return zero_loss, zero_count, {'loss_reduced': 0.0}
+        masked = output_tensor.float() * loss_mask.float()
+        local_sum = masked.sum()
+        local_num_tokens = loss_mask.float().sum().to(torch.int)
+        return local_sum, local_num_tokens, {'loss_reduced': local_sum.detach().item()}
 
     def _ref_forward_step(data_iterator, model, *args):
         batch = next(data_iterator)
@@ -301,8 +374,9 @@ def _run_pp_weight_oracle(
     assert ref_ok, "Ref optimizer step failed"
     assert ref_gn is not None and ref_gn > 0, f"Ref grad_norm={ref_gn}"
 
-    # bf16 accumulation drift from the differing LLM paths (1F1B vs.
-    # no-pipelining) requires slightly looser tolerances than bf16 rounding.
+    # LLM forward differs between 1F1B (dist, PP>1) and no-pipelining (ref),
+    # and TP shards may accumulate in a different order; keep tolerances
+    # loose enough to absorb that drift even in fp32.
     _assert_encoder_weights_match(
         ref_model.modality_submodules[encoder_name].module,
         dist_model.modality_submodules[encoder_name].module,

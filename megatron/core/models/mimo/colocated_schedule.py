@@ -78,10 +78,12 @@ def colocated_forward_backward_with_pp(
         )
         return output_tensor, partial(_loss_func, cached['loss_mask'])
 
-    # Swap in a no-op finalize so the inner PP schedule does not run DDP
-    # grad sync before Phase 3 has produced encoder grads. We invoke the
-    # original finalize once after Phase 3 (see below).
-    with _deferred_finalize(mimo_model.config) as original_finalize:
+    # Swap in a capturing finalize so the inner PP schedule does not run DDP
+    # grad sync before Phase 3 has produced encoder grads. The capture also
+    # records ``num_tokens`` that the inner schedule would have passed — we
+    # forward it to the original finalize after Phase 3 so per-token-loss
+    # configs see the correct global divisor.
+    with _deferred_finalize(mimo_model.config) as (original_finalize, capture):
         losses = schedules.forward_backward_pipelining_without_interleaving(
             forward_step_func=_lm_forward_step,
             data_iterator=cache_iter,
@@ -109,7 +111,7 @@ def colocated_forward_backward_with_pp(
     if not forward_only and original_finalize is not None:
         original_finalize(
             [mimo_model],
-            None,
+            capture.num_tokens,
             pg_collection=schedule_kwargs.get('pg_collection'),
             force_all_reduce=False,
         )
@@ -224,30 +226,53 @@ def _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first):
 
 
 def _loss_func(loss_mask, output_tensor):
-    """Default loss function for the LLM pipeline."""
-    if output_tensor is None:
-        return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
-    loss = output_tensor.float().sum()
-    return loss, {'loss_reduced': loss.detach().item()}
+    """Default loss function for the LLM pipeline.
 
-
-def _noop_finalize(*args, **kwargs):
-    """Placeholder used to suppress the inner PP schedule's finalize call.
-
-    The three-phase schedule needs to defer grad finalization until after
-    Phase 3 runs the encoder backward. See ``colocated_forward_backward_with_pp``.
+    Returns the 3-tuple ``(local_sum, local_num_tokens, log_dict)`` contract
+    expected when ``calculate_per_token_loss=True`` is set on the
+    TransformerConfig. When it is not set, the schedule divides
+    ``local_sum`` by ``local_num_tokens`` (clamped to 1), so the 3-tuple
+    form is also safe for standard per-microbatch-mean configs.
     """
-    return None
+    if output_tensor is None:
+        zero_loss = torch.tensor(0.0, device='cuda', requires_grad=True)
+        zero_count = torch.tensor(0, device='cuda', dtype=torch.int)
+        return zero_loss, zero_count, {'loss_reduced': 0.0}
+    masked = output_tensor.float() * loss_mask.float()
+    local_sum = masked.sum()
+    local_num_tokens = loss_mask.float().sum().to(torch.int)
+    return local_sum, local_num_tokens, {'loss_reduced': local_sum.detach().item()}
+
+
+class _CapturingFinalize:
+    """Capture the ``num_tokens`` the inner PP schedule would have passed.
+
+    The three-phase schedule defers grad finalization until after Phase 3
+    runs encoder backward. Replacing the config's ``finalize_model_grads_func``
+    with this object absorbs the inner schedule's invocation and stores
+    ``num_tokens`` so the post-Phase-3 call to the original finalize can
+    forward it — required for ``calculate_per_token_loss=True`` configs
+    whose finalize hook divides by the global valid-token count.
+    """
+
+    def __init__(self):
+        self.num_tokens = None
+
+    def __call__(self, model_list, num_tokens, *args, **kwargs):
+        self.num_tokens = num_tokens
+        return None
 
 
 @contextmanager
 def _deferred_finalize(config):
     """Suppress the PP schedule's end-of-run DDP grad sync; yield the
-    original so callers can invoke it once after Phase 3.
+    original finalize and a capture object so callers can invoke the
+    original (with the captured ``num_tokens``) once after Phase 3.
     """
     original = config.finalize_model_grads_func
-    config.finalize_model_grads_func = _noop_finalize
+    capture = _CapturingFinalize()
+    config.finalize_model_grads_func = capture
     try:
-        yield original
+        yield original, capture
     finally:
         config.finalize_model_grads_func = original
