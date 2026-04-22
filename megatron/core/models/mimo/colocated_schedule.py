@@ -58,9 +58,8 @@ def colocated_forward_backward_with_pp(
 
     enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
 
-    # Detach: sever autograd link to encoder so Phase 2 has no encoder collectives.
-    # Microbatch slices are views into detached_full — their .grad accumulates
-    # into detached_full.grad automatically via PyTorch's view gradient semantics.
+    # Detach so Phase 2 runs no encoder collectives; microbatch views accumulate
+    # .grad into detached_full.grad automatically.
     detached_full = {k: v.detach().requires_grad_(True) for k, v in enc_out.items()}
     lm_data = _build_lm_microbatches(detached_full, all_batches, num_microbatches)
 

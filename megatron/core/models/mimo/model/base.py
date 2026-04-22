@@ -67,13 +67,10 @@ class MimoModel(MegatronModule):
             # in TP/DP within those ranks.
             self._build_colocated_communicators()
 
-        # LLM PP>1 is already reflected in self.role; expose convenience flags
-        # for the three-phase colocated schedule.
         lang_info = self.role.modules.get(MIMO_LANGUAGE_MODULE_KEY)
         self.lm_has_pp = lang_info is not None and not (
             lang_info.is_first_stage and lang_info.is_last_stage
         )
-        self.lm_is_first_pp_stage = lang_info is None or lang_info.is_first_stage
 
         # Use special token IDs from the config
         self.special_token_ids = (

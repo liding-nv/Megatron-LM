@@ -38,6 +38,51 @@ from tests.unit_tests.models.test_mimo_colocated_correctness import (
 from tests.unit_tests.test_utilities import Utils
 
 
+def _assert_llm_weights_match_pp_aware(
+    ref_module, dist_module, pp_rank, pp_size, num_layers, rtol=1e-2, atol=1e-2
+):
+    """Assert dist LLM shards match ref (PP=1) via the same layer-index remap
+    ``_copy_llm_params_pp_aware`` uses. Non-layer params (embedding,
+    final_layernorm, output_layer) only exist on stages that own them.
+    """
+    layers_per_stage = num_layers // pp_size
+    layer_rx = re.compile(r'^(.*decoder\.layers\.)(\d+)(\..*)$')
+    ref_params = dict(ref_module.named_parameters())
+
+    mismatches = []
+    for name, dist_param in dist_module.named_parameters():
+        m = layer_rx.match(name)
+        if m:
+            prefix, local_idx_s, suffix = m.groups()
+            global_idx = pp_rank * layers_per_stage + int(local_idx_s)
+            ref_name = f"{prefix}{global_idx}{suffix}"
+        else:
+            ref_name = name
+        assert ref_name in ref_params, (
+            f"LLM param '{name}' maps to ref '{ref_name}' which does not exist "
+            f"(ref has llm_pp=1)."
+        )
+        ref_param = ref_params[ref_name]
+        assert ref_param.shape == dist_param.shape, (
+            f"LLM param '{name}': ref.shape={tuple(ref_param.shape)} != "
+            f"dist.shape={tuple(dist_param.shape)}."
+        )
+        try:
+            torch.testing.assert_close(
+                dist_param.data, ref_param.data, rtol=rtol, atol=atol
+            )
+        except AssertionError as e:
+            mismatches.append((name, ref_name, str(e)))
+
+    if mismatches:
+        rank = dist.get_rank()
+        details = "\n".join(f"  {n} -> {rn}: {msg}" for n, rn, msg in mismatches)
+        raise AssertionError(
+            f"Rank {rank}: {len(mismatches)} LLM param(s) diverged between "
+            f"PP>1 dist model and PP=1 reference:\n{details}"
+        )
+
+
 def _copy_llm_params_pp_aware(ref_module, dist_module, pp_rank, pp_size, num_layers):
     """Copy LLM params ref (PP=1) → dist (PP>=1) with layer-index remapping.
 
@@ -261,6 +306,15 @@ def _run_pp_weight_oracle(
     _assert_encoder_weights_match(
         ref_model.modality_submodules[encoder_name].module,
         dist_model.modality_submodules[encoder_name].module,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    _assert_llm_weights_match_pp_aware(
+        ref_model.language_model.module,
+        dist_model.language_model.module,
+        pp_rank=dist_llm_grid.get_pg("pp").rank(),
+        pp_size=dist_llm_pp,
+        num_layers=num_layers,
         rtol=1e-2,
         atol=1e-2,
     )
