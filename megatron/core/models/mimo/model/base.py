@@ -441,6 +441,13 @@ class MimoModel(MegatronModule):
         if self.role.mode == ModuleLayout.COLOCATED:
             if self.lm_has_pp and input_tensors is not None:
                 # PP>1 non-first stage: hidden states from P2P
+                labels, loss_mask, attention_mask = (
+                    self._maybe_shard_language_loss_inputs_for_cp(
+                        labels=labels,
+                        loss_mask=loss_mask,
+                        attention_mask=attention_mask,
+                    )
+                )
                 lm_result = self._forward_language_module(
                     input_ids,
                     position_ids,
@@ -479,6 +486,33 @@ class MimoModel(MegatronModule):
             raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
 
         raise NotImplementedError(f"Pipeline mode {self.role.mode} is not yet supported")
+
+    def _maybe_shard_language_loss_inputs_for_cp(
+        self,
+        *,
+        labels: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Shard loss-side language inputs on colocated non-first PP stages.
+
+        The first language PP stage runs ``PartitionAdapter.shard`` in
+        ``_forward_all_modules`` before sending hidden states to later PP stages.
+        Under CP those hidden states are already sequence-sharded, so the last
+        PP stage must receive labels/loss_mask sharded the same way before loss
+        computation.
+        """
+        if self.partition_adapter is None or not self.partition_adapter.cfg.use_cp:
+            return labels, loss_mask, attention_mask
+
+        _, labels, loss_mask, attention_mask, _ = self.partition_adapter.shard(
+            embeddings=None,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            packed_seq_params=None,
+        )
+        return labels, loss_mask, attention_mask
 
     def _forward_encoders(
         self,

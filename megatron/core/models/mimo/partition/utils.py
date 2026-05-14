@@ -100,12 +100,18 @@ class PartitionAdapter:
 
     def shard(
         self,
-        embeddings: torch.Tensor,
-        labels: torch.Tensor,
-        loss_mask: torch.Tensor,
-        attention_mask: torch.Tensor,
+        embeddings: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
         packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[PackedSeqParams]]:
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[PackedSeqParams],
+    ]:
         """
         Apply context parallel (CP) and sequence parallel (SP) sharding to input tensors.
 
@@ -118,23 +124,23 @@ class PartitionAdapter:
         requires sequence-first tensors.
 
         Args:
-            embeddings (torch.Tensor):
+            embeddings (Optional[torch.Tensor]):
                 Input embeddings tensor. Shape: (B, S, H)
-            labels (torch.Tensor):
+            labels (Optional[torch.Tensor]):
                 Labels tensor. Shape: (B, S)
-            loss_mask (torch.Tensor):
+            loss_mask (Optional[torch.Tensor]):
                 Loss mask tensor. Shape: (B, S)
-            attention_mask (torch.Tensor):
+            attention_mask (Optional[torch.Tensor]):
                 Attention mask tensor. Shape: (B, S)
             packed_seq_params (PackedSeqParams, optional):
                 Packed sequence parameters. Defaults to None.
 
         Returns:
             Tuple containing:
-                - embeddings (torch.Tensor): Sharded embeddings. Shape: (B, S/cp, H)
-                - labels (torch.Tensor): Possibly sharded labels. Shape: (B, S/cp)
-                - loss_mask (torch.Tensor): Possibly sharded loss mask. Shape: (B, S/cp)
-                - attention_mask (torch.Tensor): Possibly sharded attention mask. Shape: (B, S/cp)
+                - embeddings (Optional[torch.Tensor]): Sharded embeddings. Shape: (B, S/cp, H)
+                - labels (Optional[torch.Tensor]): Possibly sharded labels. Shape: (B, S/cp)
+                - loss_mask (Optional[torch.Tensor]): Possibly sharded loss mask. Shape: (B, S/cp)
+                - attention_mask (Optional[torch.Tensor]): Possibly sharded attention mask. Shape: (B, S/cp)
                 - packed_seq_params (PackedSeqParams, optional): Updated packed sequence parameters.
         """
         if not (self.cfg.use_cp or self.cfg.seq_parallel):
