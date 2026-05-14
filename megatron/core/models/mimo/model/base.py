@@ -1,8 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import logging
 import warnings
-from typing import Any, Dict, Optional
+from typing import Any, Callable, ContextManager, Dict, Optional
 
 import torch
 
@@ -18,6 +19,19 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import unwrap_model
 
 logger = logging.getLogger(__name__)
+
+
+# A factory that returns a fresh ContextManager each time it is called. Used
+# by ``MimoModel`` to apply a module-scoped CUDA RNG state at every per-module
+# construction and forward boundary so that encoder and language modules with
+# different ``tp_rank`` coordinates (asymmetric TP under colocated heterogeneous
+# TP/DP) each draw from their own TP-region RNG.
+#
+# The factory shape (rather than a single ``ContextManager``) is required
+# because mcore enters the same module's scope multiple times — once during
+# construction and once per forward call — and a ``ContextManager`` object is
+# typically one-shot.
+RNGScopeFactory = Callable[[], ContextManager[None]]
 
 
 class MimoModel(MegatronModule):
@@ -39,8 +53,36 @@ class MimoModel(MegatronModule):
             Configuration for the model, including language model and modality submodules
     """
 
-    def __init__(self, mimo_config: MimoModelConfig, cp_group=None, tp_group=None) -> None:
+    def __init__(
+        self,
+        mimo_config: MimoModelConfig,
+        cp_group=None,
+        tp_group=None,
+        module_rng_scopes: Optional[Dict[str, RNGScopeFactory]] = None,
+    ) -> None:
         """Initialize the multimodal model.
+
+        Args:
+            mimo_config: Configuration for the model (language + modality specs,
+                module-to-grid map, etc.).
+            cp_group: Optional context-parallel group, threaded into the
+                ``PartitionAdapter`` when language CP > 1 or sequence-parallel.
+            tp_group: Optional language tensor-parallel group, threaded into the
+                ``PartitionAdapter``.
+            module_rng_scopes: Optional per-module RNG scope factories. When set,
+                each module's construction (``_initialize_submodules`` and
+                ``_initialize_language_model``) and every per-module forward
+                boundary inside ``get_text_embeddings``, ``_forward_encoders``,
+                ``_forward_language_module``, ``encode_and_communicate``, and
+                ``_forward_all_modules`` is bracketed with the corresponding
+                factory's context manager. Required for asymmetric TP under
+                colocated heterogeneous TP/DP, where encoder and language
+                modules have different ``tp_rank`` coordinates and therefore
+                need their own CUDA RNG tracker states. When ``None`` (default),
+                every per-module boundary uses ``contextlib.nullcontext()`` and
+                behavior is unchanged from prior releases. The caller (Bridge)
+                owns the snapshot dict and constructs each factory to swap the
+                singleton CUDA RNG tracker via ``get_states()`` / ``set_states()``.
 
         Example:
             ```python
@@ -57,6 +99,8 @@ class MimoModel(MegatronModule):
             category=UserWarning,
             stacklevel=2,
         )
+
+        self._module_rng_scopes: Dict[str, RNGScopeFactory] = module_rng_scopes or {}
 
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
@@ -204,11 +248,29 @@ class MimoModel(MegatronModule):
 
         return combined_embeddings.transpose(0, 1).contiguous()  # [S, B, H]
 
+    def _scope(self, module_name: str) -> ContextManager[None]:
+        """Return the RNG scope context for ``module_name``.
+
+        When ``module_rng_scopes`` is unset for the model or for the requested
+        module, returns ``contextlib.nullcontext()`` so the wrapped block runs
+        without any RNG state swap (preserves pre-task behavior).
+
+        The factory is invoked here, not stored, because each call must yield a
+        fresh context manager — the same module's scope is entered multiple
+        times across construction and forward.
+        """
+        factory = self._module_rng_scopes.get(module_name)
+        return factory() if factory is not None else contextlib.nullcontext()
+
     def _initialize_submodules(self) -> None:
         """Initialize modality submodules from the ModuleSpec configurations.
 
         When role is set, only initializes submodules this rank participates in.
         Stage info is passed to from_spec() to conditionally skip projection.
+
+        Each submodule's construction is bracketed by its module RNG scope so
+        TP-sharded weight init and any RNG-touching builders draw from that
+        module's CUDA RNG tracker state.
         """
         for modality_name, submodule_spec in self.mimo_config.modality_submodules_spec.items():
             if modality_name not in self.role.modules:
@@ -226,9 +288,10 @@ class MimoModel(MegatronModule):
             )
 
             # Pass stage info to from_spec so projections are only built when needed
-            submodule = submodule_class.from_spec(
-                submodule_spec, is_first_stage=is_first_stage, is_last_stage=is_last_stage
-            )
+            with self._scope(modality_name):
+                submodule = submodule_class.from_spec(
+                    submodule_spec, is_first_stage=is_first_stage, is_last_stage=is_last_stage
+                )
 
             self.modality_submodules[modality_name] = submodule
 
@@ -236,6 +299,7 @@ class MimoModel(MegatronModule):
         """Initialize the language model.
 
         When role is set, only initializes if this rank participates in language module.
+        Construction is bracketed by the language module's RNG scope.
         """
         if not self.role.has_language_module:
             logger.debug("Skipping language model initialization (not in role)")
@@ -245,7 +309,8 @@ class MimoModel(MegatronModule):
         logger.debug(
             f"Building language model using {self.mimo_config.language_model_spec.module.__name__}"
         )
-        self.language_model = build_module(self.mimo_config.language_model_spec)
+        with self._scope(MIMO_LANGUAGE_MODULE_KEY):
+            self.language_model = build_module(self.mimo_config.language_model_spec)
 
     def set_input_tensor(self, input_tensor):
         """Set input tensor for pipeline parallelism.
@@ -307,11 +372,17 @@ class MimoModel(MegatronModule):
             position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
         )
 
-        text_embeddings = (
-            unwrap_model(self.language_model)
-            .embedding(input_ids=input_ids_text, position_ids=position_ids_text)
-            .squeeze(1)
-        )  # Shape: [num_text_tokens, hidden_dim]
+        # Embedding lookup may draw TP-region RNG (e.g., embedding dropout under
+        # training). Run inside the language module's scope so the right
+        # tp_rank-keyed state is active even when this method is invoked
+        # directly by external callers (the embedding-bypass path that
+        # downstream Bridge-side forward hooks could not cover).
+        with self._scope(MIMO_LANGUAGE_MODULE_KEY):
+            text_embeddings = (
+                unwrap_model(self.language_model)
+                .embedding(input_ids=input_ids_text, position_ids=position_ids_text)
+                .squeeze(1)
+            )  # Shape: [num_text_tokens, hidden_dim]
         return text_embeddings
 
     def forward(
@@ -370,6 +441,13 @@ class MimoModel(MegatronModule):
         if self.role.mode == ModuleLayout.COLOCATED:
             if self.lm_has_pp and input_tensors is not None:
                 # PP>1 non-first stage: hidden states from P2P
+                labels, loss_mask, attention_mask = (
+                    self._maybe_shard_language_loss_inputs_for_cp(
+                        labels=labels,
+                        loss_mask=loss_mask,
+                        attention_mask=attention_mask,
+                    )
+                )
                 lm_result = self._forward_language_module(
                     input_ids,
                     position_ids,
@@ -409,6 +487,33 @@ class MimoModel(MegatronModule):
 
         raise NotImplementedError(f"Pipeline mode {self.role.mode} is not yet supported")
 
+    def _maybe_shard_language_loss_inputs_for_cp(
+        self,
+        *,
+        labels: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Shard loss-side language inputs on colocated non-first PP stages.
+
+        The first language PP stage runs ``PartitionAdapter.shard`` in
+        ``_forward_all_modules`` before sending hidden states to later PP stages.
+        Under CP those hidden states are already sequence-sharded, so the last
+        PP stage must receive labels/loss_mask sharded the same way before loss
+        computation.
+        """
+        if self.partition_adapter is None or not self.partition_adapter.cfg.use_cp:
+            return labels, loss_mask, attention_mask
+
+        _, labels, loss_mask, attention_mask, _ = self.partition_adapter.shard(
+            embeddings=None,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            packed_seq_params=None,
+        )
+        return labels, loss_mask, attention_mask
+
     def _forward_encoders(
         self,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
@@ -430,10 +535,11 @@ class MimoModel(MegatronModule):
                 continue
 
             submodule = self.modality_submodules[encoder_name]
-            output = submodule.forward(
-                encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
-                hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
-            )
+            with self._scope(encoder_name):
+                output = submodule.forward(
+                    encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
+                    hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
+                )
 
             if output is not None:
                 outputs[encoder_name] = output
@@ -471,7 +577,9 @@ class MimoModel(MegatronModule):
                     if name != lang_name:
                         modality_embeddings[name] = tensor
 
-            # Get text embeddings
+            # Get text embeddings (already wrapped in language scope internally,
+            # but the call lands here under the language scope as well so any
+            # subsequent in-method RNG draws stay consistent).
             text_embeddings = self.get_text_embeddings(
                 input_ids, position_ids, self.special_token_ids
             )
@@ -484,13 +592,14 @@ class MimoModel(MegatronModule):
                 special_token_ids=self.special_token_ids,
             )
 
-            lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                decoder_input=combined_embeddings,
-                labels=labels,
-                attention_mask=attention_mask,
-            )
+            with self._scope(lang_name):
+                lm_output = self.language_model(
+                    input_ids=None,
+                    position_ids=None,
+                    decoder_input=combined_embeddings,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                )
         else:
             # Non-first stage: receive hidden states from previous LM stage
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
@@ -501,13 +610,14 @@ class MimoModel(MegatronModule):
                 if hasattr(underlying_lm, 'set_input_tensor'):
                     underlying_lm.set_input_tensor(hidden_states)
 
-            lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                decoder_input=None,
-                labels=labels,
-                attention_mask=attention_mask,
-            )
+            with self._scope(lang_name):
+                lm_output = self.language_model(
+                    input_ids=None,
+                    position_ids=None,
+                    decoder_input=None,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                )
 
         # Key output for non-last stages so schedule can route to next LM stage
         if not self.role.is_last_stage(lang_name):
@@ -561,7 +671,8 @@ class MimoModel(MegatronModule):
                 and modality_name in modality_inputs
                 and modality_inputs[modality_name] is not None
             ):
-                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
+                with self._scope(modality_name):
+                    embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
                     modality_embeddings[modality_name] = embeddings
         if self.colocated_comms:
@@ -637,14 +748,15 @@ class MimoModel(MegatronModule):
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model
-        lm_output = self.language_model(
-            input_ids=None,
-            position_ids=None,
-            decoder_input=combined_embeddings,
-            labels=labels,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-        )
+        with self._scope(MIMO_LANGUAGE_MODULE_KEY):
+            lm_output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=combined_embeddings,
+                labels=labels,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+            )
 
         logger.debug(f"Language model output shape: {lm_output.shape}")
 

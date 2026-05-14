@@ -69,14 +69,21 @@ def colocated_forward_backward_with_pp(
 
     def _lm_forward_step(data_iterator_unused, model, *args):
         cached = next(cache_iter)
-        output_tensor, loss_mask = model(
+        output = model(
             input_ids=cached['input_ids'],
             labels=cached['labels'],
             loss_mask=cached['loss_mask'],
             position_ids=cached['position_ids'],
             encoder_embeddings=cached['encoder_embeddings'],
         )
-        return output_tensor, partial(_loss_func, cached['loss_mask'])
+        loss_mask = cached['loss_mask']
+        if isinstance(output, tuple):
+            output_tensor, model_loss_mask = output
+            if model_loss_mask is not None:
+                loss_mask = model_loss_mask
+        else:
+            output_tensor = output
+        return output_tensor, partial(_loss_func, loss_mask)
 
     # Swap in a capturing finalize so the inner PP schedule does not run DDP
     # grad sync before Phase 3 has produced encoder grads. The capture also
